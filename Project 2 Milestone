@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Activity-aware insulin PID model:
+Combines glucose, activity, sleep (HR), and insulin data
+to simulate insulin requirements during exercise.
+"""
+
+import pandas as pd
+import pathlib
+import os
+import re
+
+# ------------------------------------------------------------
+# PID Controller Class
+# ------------------------------------------------------------
+class ActivityAwarePID:
+    def __init__(self, setpoint, kp, ki, kd, basal_base,
+                 hr_threshold, hr_gain, sleep_decrease):
+        self.setpoint = setpoint
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.baseline_basal = basal_base
+        self.hr_threshold = hr_threshold          # heart rate threshold for exercise
+        self.hr_gain = hr_gain                    # how much insulin is reduced/increased
+        self.sleep_decrease = sleep_decrease
+        self.integral = 0.0
+        self.prev_error = None
+
+    def step(self, glucose, hr, active, dt=1.0):
+        """
+        Compute insulin dose based on glucose, HR, and activity.
+        - HR above threshold → reduce insulin slightly (exercise effect)
+        - Activity non-sedentary → amplify PID response
+        """
+        error = self.setpoint - glucose
+        self.integral += error * dt
+        derivative = 0.0 if self.prev_error is None else (error - self.prev_error) / dt
+        self.prev_error = error
+
+        pid_term = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        # Exercise compensation
+        if hr > self.hr_threshold:
+            pid_term *= self.hr_gain
+
+        # Basal is reduced during sleep
+        basal = self.baseline_basal * (self.sleep_decrease if not active else 1.0)
+
+        total = basal + pid_term
+        return max(total, 0.0), basal, pid_term
+    
+# ------------------------------------------------------------
+# Load & merge all patient CSVs
+# ------------------------------------------------------------
+def load_patient_data(folder, pid):
+    """
+    Load and merge all CSVs (Glucose, Activity, Sleep, Bolus, Basal)
+    based on nearest timestamps.
+    """
+    pattern = re.compile(rf"UoM(\w+){pid}\.csv", re.I)
+    files = [f for f in os.listdir(folder) if pattern.match(f)]
+
+    if not files:
+        raise FileNotFoundError(f"No CSVs found for patient {pid}")
+
+    merged_df = None
+
+    for f in files:
+        category = pattern.match(f).group(1).lower()
+        path = os.path.join(folder, f)
+        df = pd.read_csv(path)
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # Identify time column
+        time_col = next((c for c in df.columns if re.search(r"time|date|ts$", c, re.I)), None)
+        if not time_col:
+            raise RuntimeError(f"No time column in {f}")
+        df[time_col] = pd.to_datetime(df[time_col], errors='coerce', dayfirst=True)
+        df = df.dropna(subset=[time_col]).sort_values(time_col)
+
+        # Identify value column(s)
+        value_cols = [c for c in df.columns if c != time_col]
+        if not value_cols:
+            continue
+
+        # Standardize names
+        rename_map = {}
+        if 'glucose' in category:
+            rename_map[value_cols[0]] = 'glucose'
+        elif 'activity' in category:
+            # e.g. "activitytype" or "step_count"
+            rename_map[value_cols[0]] = 'activity_type'
+            if len(value_cols) > 1:
+                rename_map[value_cols[1]] = 'step_count'
+        elif 'sleep' in category:
+            rename_map[value_cols[0]] = 'heart_rate'
+        elif 'basal' in category:
+            rename_map[value_cols[0]] = 'basal'
+        elif 'bolus' in category:
+            rename_map[value_cols[0]] = 'bolus'
+
+        df = df.rename(columns=rename_map)
+        df = df[[time_col] + list(rename_map.values())]
+        df = df.rename(columns={time_col: 'Time'})
+
+        if merged_df is None:
+            merged_df = df
+        else:
+            merged_df = pd.merge_asof(merged_df, df, on='Time', direction='nearest', tolerance=pd.Timedelta('5min'))
+
+# 🧹 Remove duplicate columns that may appear as heart_rate_x, heart_rate_y, etc.
+            merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+            merged_df.columns = [c.split('_')[0] if c.endswith(('_x', '_y')) else c for c in merged_df.columns]
+    return merged_df
+
+
+# ------------------------------------------------------------
+# Main routine
+# ------------------------------------------------------------
+def main(folder, output_folder, id_lo=None, id_hi=None, patient_list=None):
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Determine which patient IDs to process
+    if patient_list is not None:
+        ids = patient_list
+    else:
+        ids = range(id_lo or 2301, (id_hi or 2405) + 1)
+
+    for pid in ids:
+        try:
+            df = load_patient_data(folder, pid)
+            ...
+
+        except FileNotFoundError:
+            print(f"⚠️ Skipping {pid}: No data found.")
+            continue
+
+        # Add derived columns
+        df['is_active'] = df['activity_type'].apply(lambda x: str(x).lower() != 'sedentary' if pd.notna(x) else False)
+        if 'heart_rate' in df.columns:
+            df['heart_rate'] = df['heart_rate'].ffill()
+        else:
+            df['heart_rate'] = np.nan  # or assign a default if you prefer
+
+
+        # Basal average
+        basal_mean = df['basal'].mean() if 'basal' in df.columns else 0.5
+
+        pid_cfg = dict(
+            setpoint=110.0,
+            kp=0.02,
+            ki=0.0005,
+            kd=0.001,
+            basal_base=basal_mean,
+            hr_threshold=100,       # HR threshold for exercise
+            hr_gain=0.8,            # Reduce insulin when HR high
+            sleep_decrease=0.6,     # Less basal when sleeping
+        )
+
+        model = ActivityAwarePID(**pid_cfg)
+        results = []
+
+        for _, row in df.iterrows():
+            glucose = row.get('glucose', None)
+            hr = float(row.get('heart_rate', 0)) if pd.notna(row.get('heart_rate', None)) else 0.0
+            active = row.get('is_active', False)
+            if pd.isna(glucose):
+                continue
+
+            dose, basal, pid_t = model.step(glucose=glucose, hr=hr, active=active)
+            results.append({
+                "Time": row["Time"],
+                "Glucose": glucose,
+                "HeartRate": hr,
+                "ActivityType": row.get('activity_type', None),
+                "StepCount": row.get('step_count', None),
+                "CalculatedDose": dose,
+                "BasalOutput": basal,
+                "PIDterm": pid_t,
+                "PatientID": pid,
+            })
+
+        out_df = pd.DataFrame(results)
+        out_path = os.path.join(output_folder, f"Patient_{pid}_Modeled.csv")
+        out_df.to_csv(out_path, index=False)
+        print(f"✔︎ Written {len(out_df)} rows for Patient {pid} → {out_path}")
+
+import matplotlib.pyplot as plt
+
+def visualize_patient_results(output_folder, patient_ids, show=True):
+    """
+    Generate time-series plots for modeled patients.
+    Shows Glucose, Heart Rate, and Calculated Dose over time.
+    """
+    for pid in patient_ids:
+        path = os.path.join(output_folder, f"Patient_{pid}_Modeled.csv")
+        if not os.path.exists(path):
+            print(f"⚠️ No output file found for {pid}, skipping visualization.")
+            continue
+
+        df = pd.read_csv(path, parse_dates=["Time"])
+        if df.empty:
+            print(f"⚠️ {pid}: empty dataframe, skipping.")
+            continue
+
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        # --- Glucose ---
+        ax1.plot(df["Time"], df["Glucose"], color='tab:red', label="Glucose (mg/dL)")
+        ax1.axhline(110, color='tab:red', linestyle='--', alpha=0.5, label="Setpoint (110 mg/dL)")
+        ax1.set_ylabel("Glucose (mg/dL)", color='tab:red')
+        ax1.tick_params(axis='y', labelcolor='tab:red')
+
+        # --- Heart Rate ---
+        if "heart_rate" in df.columns:
+            ax2 = ax1.twinx()
+            ax2.plot(df["Time"], df["heart_rate"], color='tab:green', alpha=0.4, label="Heart Rate (bpm)")
+            ax2.set_ylabel("Heart Rate (bpm)", color='tab:green')
+            ax2.tick_params(axis='y', labelcolor='tab:green')
+
+        # --- Calculated Insulin Dose ---
+        if "CalculatedDose" in df.columns:
+            ax3 = ax1.twinx()
+            ax3.spines["right"].set_position(("outward", 60))
+            ax3.plot(df["Time"], df["CalculatedDose"], color='tab:blue', alpha=0.6, label="Calculated Insulin (U)")
+            ax3.set_ylabel("Calculated Insulin (U)", color='tab:blue')
+            ax3.tick_params(axis='y', labelcolor='tab:blue')
+
+        # --- Title and Legends ---
+        plt.title(f"Patient {pid}: Glucose, Heart Rate, and Predicted Insulin Dose")
+        fig.tight_layout()
+        fig.legend(loc="upper left", bbox_to_anchor=(0.1, 0.9))
+        
+        if show:
+            plt.show()
+        else:
+            out_path = os.path.join(output_folder, f"Patient_{pid}_Visualization.png")
+            plt.savefig(out_path)
+            plt.close()
+            print(f"📈 Saved plot → {out_path}")
+
+if __name__ == "__main__":
+    data_folder = "/blue/bme4409/ndadisman"
+    output_folder = "/blue/bme4409/ndadisman/Outputs"
+    patient_ids = [2301,2302,2303,2304,2305,2306,2307,2308,2309,2310,2313,2320,2401,2404,2405]
+    main(data_folder, output_folder, id_lo=None, id_hi=None, patient_list=patient_ids)
+    visualize_patient_results(output_folder, patient_ids, show=False)
