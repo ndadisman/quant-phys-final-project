@@ -1,0 +1,183 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import glob
+import os
+
+# --- PID Controller Class ---
+class InsulinController:
+    def __init__(self, kp=0.02, ki=0.0005, kd=0.01, setpoint=110, baseline_basal=1.0, sleep_decrease=0.8):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.setpoint = setpoint  # mg/dL
+        self.baseline_basal = baseline_basal
+        self.sleep_decrease = sleep_decrease
+        self.integral = 0
+        self.prev_error = None
+
+    def step(self, glucose, hr, active, dt=1.0):
+        # --- Glucose control (PID) ---
+        error = glucose - self.setpoint  # ✅ reversed direction
+        self.integral = 0.9 * self.integral + error * dt  # ✅ decaying integral
+        derivative = 0 if self.prev_error is None else (error - self.prev_error) / dt
+        self.prev_error = error
+
+        pid_term = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        # --- HR-based insulin sensitivity adjustment ---
+        hr_effect = 1.0 - 0.005 * max(0, hr - 80)
+        hr_effect = max(hr_effect, 0.5)
+
+        # --- Basal rate modulation ---
+        basal = self.baseline_basal
+        if not active:
+            basal *= self.sleep_decrease
+
+        # --- Combine ---
+        total = basal + pid_term * hr_effect
+
+        # --- Safety limits ---
+        total = max(min(total, 10.0), 0.0)  # 0–10 U/hr cap
+
+        return total, basal, pid_term
+
+
+# --- Data Loading Function ---
+def load_patient_data(folder_path):
+    all_data = []
+    files = sorted(glob.glob(os.path.join(folder_path, "*.csv")))
+    
+    # --- Safety check ---
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in folder: {folder_path}\n"
+                                "→ Make sure your data folder path is correct, e.g. './my_data/'")
+
+    merged_df = None
+
+    for f in files:
+        df = pd.read_csv(f)
+        df.columns = [c.strip().lower() for c in df.columns]
+        time_col = [c for c in df.columns if 'time' in c]
+        if not time_col:
+            print(f"⚠️ Skipping {os.path.basename(f)} — no time column found.")
+            continue
+        time_col = time_col[0]
+        value_cols = [c for c in df.columns if c != time_col]
+
+        rename_map = {}
+        for c in value_cols:
+            if 'glucose' in c:
+                rename_map[c] = 'glucose'
+            elif 'heart' in c or 'hr' in c:
+                rename_map[c] = 'heart_rate'
+            elif 'activity' in c:
+                rename_map[c] = 'activity'
+            elif 'basal' in c:
+                rename_map[c] = 'basal'
+
+        if not rename_map:
+            print(f"⚠️ Skipping {os.path.basename(f)} — no recognizable data columns.")
+            continue
+
+        df = df.rename(columns=rename_map)
+        df = df[[time_col] + list(rename_map.values())]
+        df = df.rename(columns={time_col: 'Time'})
+        df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+        df = df.sort_values('Time').dropna(subset=['Time'])
+
+        # --- Convert glucose units if necessary ---
+        if 'glucose' in df.columns:
+            median_gluc = df['glucose'].median()
+            if median_gluc < 30:  # mmol/L to mg/dL
+                df['glucose'] = df['glucose'] * 18.0
+                print(f"ℹ️ Converted glucose from mmol/L to mg/dL for {os.path.basename(f)} (median={median_gluc:.1f})")
+
+        if merged_df is None:
+            merged_df = df
+        else:
+            merged_df = pd.merge_asof(
+                merged_df,
+                df,
+                on='Time',
+                direction='nearest',
+                tolerance=pd.Timedelta('5min')
+            )
+
+    if merged_df is None:
+        raise ValueError("No valid data files were loaded — check your folder contents.")
+
+    merged_df = merged_df.drop_duplicates(subset='Time')
+    merged_df = merged_df.set_index('Time').interpolate(method='time').ffill().bfill()
+    return merged_df
+
+
+# --- Simulation Function ---
+def simulate_controller(data, controller):
+    insulin_rates = []
+    basals = []
+    pid_terms = []
+    times = []
+    glucose_values = []
+    hr_values = []
+
+    for i in range(len(data)):
+        glucose = data['glucose'].iloc[i] if 'glucose' in data else np.nan
+        hr = data['heart_rate'].iloc[i] if 'heart_rate' in data else 70
+        active = (data['activity'].iloc[i] > 0.1) if 'activity' in data else False
+
+        insulin, basal, pid_term = controller.step(glucose, hr, active)
+
+        insulin_rates.append(insulin)
+        basals.append(basal)
+        pid_terms.append(pid_term)
+        times.append(data.index[i])
+        glucose_values.append(glucose)
+        hr_values.append(hr)
+
+    result_df = pd.DataFrame({
+        'Time': times,
+        'Glucose': glucose_values,
+        'Heart_Rate': hr_values,
+        'Basal': basals,
+        'PID_Term': pid_terms,
+        'Insulin_Rate': insulin_rates
+    }).set_index('Time')
+
+    return result_df
+
+
+# --- Plotting ---
+def plot_results(df):
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    ax1.plot(df.index, df['Glucose'], color='tab:red', label='Glucose (mg/dL)')
+    ax1.axhline(110, color='tab:red', linestyle='--', alpha=0.7)
+    ax1.set_ylabel('Glucose (mg/dL)', color='tab:red')
+    ax1.tick_params(axis='y', labelcolor='tab:red')
+
+    ax2 = ax1.twinx()
+    ax2.plot(df.index, df['Insulin_Rate'], color='tab:blue', label='Insulin (U/hr)')
+    ax2.set_ylabel('Insulin Rate (U/hr)', color='tab:blue')
+    ax2.tick_params(axis='y', labelcolor='tab:blue')
+
+    plt.title('PID-Controlled Insulin Delivery with HR Adjustment')
+    plt.show()
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    folder_path = "data"  # <-- replace with your folder path
+    data = load_patient_data(folder_path)
+
+    controller = InsulinController(
+        kp=0.02,
+        ki=0.0005,
+        kd=0.01,
+        setpoint=110,
+        baseline_basal=1.0,
+        sleep_decrease=0.8
+    )
+
+    result = simulate_controller(data, controller)
+    plot_results(result)
