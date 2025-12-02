@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# -------------------- User settings --------------------
+DAYFIRST = True
+HR_THRESHOLD = 100             # bpm
+SENSITIVITY_FACTOR = 0.8       # scale S_I if HR > threshold
+RESAMPLE_FREQ = "1min"
+GLU_TO_MGDL = 18.0
+OUT_FOLDER = "/blue/bme4409/ndadisman/FinalOutputs"
+
+ANCHOR_EVERY_MIN = 5           # optional for measurement resync
+
+# -------------------- DE Parameters --------------------
+k_I = 0.05                     # insulin decay per min
+S_I_BASE = 0.001               # insulin sensitivity
+EGP = 1.0                       # endogenous glucose production mg/dL/min
+BOLUS_SPREAD_MIN = 60           # spread bolus over this many minutes
+
+# -------------------- Helper functions --------------------
+def parse_datetime_series(series):
+    return pd.to_datetime(series, dayfirst=DAYFIRST, errors="coerce")
+
+def load_single_dataset(folder, pid, filename_template, time_col, value_col):
+    path = os.path.join(folder, filename_template.format(pid=pid))
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path)
+    cols_lower = {c.lower(): c for c in df.columns}
+    if time_col.lower() not in cols_lower or value_col.lower() not in cols_lower:
+        return None
+    tcol = cols_lower[time_col.lower()]
+    vcol = cols_lower[value_col.lower()]
+    df[tcol] = parse_datetime_series(df[tcol])
+    df = df.dropna(subset=[tcol, vcol]).sort_values(tcol)
+    df = df.drop_duplicates(subset=[tcol], keep="first")
+    df = df[[tcol, vcol]].rename(columns={tcol: "Time", vcol: value_col})
+    df = df.reset_index(drop=True)
+    return df
+
+def resample_to_grid(df, start_time, end_time, value_col, fill_zeros=False):
+    idx = pd.date_range(start=start_time, end=end_time, freq=RESAMPLE_FREQ)
+    df_r = df.set_index("Time").reindex(idx)
+    if fill_zeros:
+        df_r[value_col] = df_r[value_col].fillna(0.0)
+    else:
+        df_r[value_col] = df_r[value_col].interpolate(method="time", limit_direction="both")
+    df_r = df_r.rename_axis("Time").reset_index()
+    return df_r
+
+def pick_xticks(times, max_ticks=12):
+    L = len(times)
+    if L <= max_ticks:
+        return times
+    idx = np.linspace(0, L - 1, max_ticks, dtype=int)
+    return times[idx]
+
+# -------------------- Core DE processing --------------------
+def process_patient(folder, pid_input, out_folder):
+    pid_str = str(pid_input)
+
+    # Load datasets
+    g = load_single_dataset(folder, pid_input, "UoMGlucose{pid}.csv", "bg_ts", "value")
+    bol = load_single_dataset(folder, pid_input, "UoMBolus{pid}.csv", "bolus_ts", "bolus_dose")
+    basal = load_single_dataset(folder, pid_input, "UoMBasal{pid}.csv", "basal_ts", "basal_dose")
+    s = load_single_dataset(folder, pid_input, "UoMsleep{pid}.csv", "sleep_ts", "heart_rate")
+
+    if g is None or bol is None or basal is None or s is None:
+        print(f"⚠ Patient {pid_str}: missing file(s) — skipping")
+        return
+
+    # 24-hour overlap
+    overlap_start = max(df["Time"].min() for df in (g, bol, basal, s))
+    overlap_end = min(df["Time"].max() for df in (g, bol, basal, s))
+    if pd.isna(overlap_start) or pd.isna(overlap_end) or (overlap_end - overlap_start) < pd.Timedelta(hours=24):
+        print(f"⚠ Patient {pid_str}: no 24-hour common window — skipping")
+        return
+
+    start_time = overlap_start
+    end_time = start_time + pd.Timedelta(hours=24)
+
+    # Resample
+    g_r = resample_to_grid(g, start_time, end_time, "value")
+    bol_r = resample_to_grid(bol, start_time, end_time, "bolus_dose", fill_zeros=True)
+    basal_r = resample_to_grid(basal, start_time, end_time, "basal_dose")
+    s_r = resample_to_grid(s, start_time, end_time, "heart_rate")
+    s_r["heart_rate"] = s_r["heart_rate"].ffill().bfill()
+
+    # Convert glucose
+    g_r["glucose_mgdl"] = g_r["value"] * GLU_TO_MGDL
+    g_r["glucose_deriv"] = g_r["glucose_mgdl"].diff().fillna(0.0)
+    s_r["hr_delta"] = s_r["heart_rate"].diff().fillna(0.0)
+
+    # Basal U/hour -> U/min
+    basal_vals_hour = basal_r["basal_dose"].ffill().bfill().values
+    basal_per_min = basal_vals_hour / 60.0
+
+    # Bolus spread
+    bolus_vals = bol_r["bolus_dose"].fillna(0.0).values
+    kernel_len = max(1, int(BOLUS_SPREAD_MIN))
+    t_idx = np.arange(kernel_len)
+    tau = kernel_len / 3.0
+    kernel = np.exp(-t_idx / tau)
+    kernel = kernel / kernel.sum()
+    bolus_spread = np.convolve(bolus_vals, kernel, mode="full")[: len(bolus_vals)]
+
+    # Adjust basal per HR & glucose deriv
+    adjusted_basal_per_min = basal_per_min.copy()
+    for t in range(len(adjusted_basal_per_min)):
+        if (g_r["glucose_deriv"].iloc[t] < 0) and (s_r["hr_delta"].iloc[t] > 0):
+            adjusted_basal_per_min[t] = 0.0
+        elif s_r["heart_rate"].iloc[t] > HR_THRESHOLD:
+            adjusted_basal_per_min[t] = basal_per_min[t]  # DE uses S_I scaling later
+        else:
+            adjusted_basal_per_min[t] = basal_per_min[t]
+
+    # -------------------- Differential Equation Simulation --------------------
+    n = len(g_r)
+    dt = 1.0  # minute
+    I = np.zeros(n)
+    G = np.zeros(n)
+    G[0] = g_r["glucose_mgdl"].iloc[0]
+
+    for t in range(1, n):
+        # Insulin input = basal + bolus
+        U_t = adjusted_basal_per_min[t] + bolus_spread[t]
+
+        # Insulin compartment
+        I[t] = I[t-1] + dt * (-k_I * I[t-1] + U_t)
+
+        # Insulin sensitivity scaling
+        S_I = S_I_BASE
+        if s_r["heart_rate"].iloc[t] > HR_THRESHOLD:
+            S_I *= SENSITIVITY_FACTOR
+
+        # Glucose compartment
+        dGdt = -S_I * I[t] * G[t-1] + EGP
+        G[t] = G[t-1] + dt * dGdt
+
+        # Anchor every few minutes to measured glucose
+        if (t % ANCHOR_EVERY_MIN) == 0:
+            meas = g_r["glucose_mgdl"].iloc[t]
+            if not np.isnan(meas):
+                G[t] = meas
+
+        # Floor to avoid non-physiologic glucose
+        if G[t] < 20.0:
+            G[t] = 20.0
+
+    # -------------------- Build merged dataframe --------------------
+    merged = pd.DataFrame({
+        "Time": g_r["Time"].values,
+        "glucose_mmolL": g_r["value"].values,
+        "glucose_mgdl": g_r["glucose_mgdl"].values,
+        "glucose_deriv_mgdl_per_min": g_r["glucose_deriv"].values,
+        "heart_rate": s_r["heart_rate"].values,
+        "hr_delta": s_r["hr_delta"].values,
+        "bolus_dose": bolus_vals,
+        "bolus_spread_U_per_min": bolus_spread,
+        "basal_dose_U_per_hour": basal_vals_hour,
+        "basal_per_min_U": basal_per_min,
+        "adjusted_basal_per_min_U": adjusted_basal_per_min,
+        "insulin_compartment_U": I,
+        "predicted_glucose_mgdl": G
+    })
+
+    # -------------------- Save CSV --------------------
+    os.makedirs(out_folder, exist_ok=True)
+    out_csv = os.path.join(out_folder, f"Patient_{pid_str}_model_DE.csv")
+    merged.to_csv(out_csv, index=False)
+    print(f"Wrote: {out_csv}")
+
+    # -------------------- Plotting --------------------
+    # Plot 1: measured glucose, HR, bolus, basal
+    fig, ax1 = plt.subplots(figsize=(12,6))
+    ax1.plot(merged["Time"], merged["glucose_mgdl"], color="tab:orange", label="Measured glucose")
+    ax1.set_ylabel("Glucose (mg/dL)", color="tab:orange")
+    ax1.tick_params(axis="y", labelcolor="tab:orange")
+
+    ax2 = ax1.twinx()
+    ax2.plot(merged["Time"], merged["heart_rate"], color="tab:green", alpha=0.5, label="Heart rate")
+    ax2.set_ylabel("Heart rate (bpm)", color="tab:green")
+
+    ax3 = ax1.twinx()
+    ax3.spines["right"].set_position(("outward", 60))
+    nz = merged["bolus_dose"] > 0
+    if nz.any():  # only plot if there is at least one nonzero bolus
+        ax3.stem(merged["Time"].values[nz], merged["bolus_dose"].values[nz],
+                 linefmt="C3-", markerfmt="C3o", basefmt=" ", label="Bolus (U)")
+    ax3.plot(merged["Time"], merged["basal_dose_U_per_hour"], color="tab:blue", alpha=0.7, label="Basal (U/hour)")
+    ax3.set_ylabel("Insulin (U)", color="tab:blue")
+
+    ticks = pick_xticks(merged["Time"].values, max_ticks=12)
+    ax1.set_xticks(ticks)
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+    plt.setp(ax1.get_xticklabels(), rotation=45, ha="right")
+
+    lines, labels = [], []
+    for ax in (ax1, ax2, ax3):
+        lns, lbs = ax.get_legend_handles_labels()
+        lines += lns; labels += lbs
+    ax1.legend(lines, labels, loc="upper right")
+    p1 = os.path.join(out_folder, f"Patient_{pid_str}_Original.png")
+    fig.tight_layout()
+    fig.savefig(p1)
+    plt.close(fig)
+
+    # Plot 2: DE predicted glucose, HR, bolus, adjusted basal
+    fig, ax1 = plt.subplots(figsize=(12,6))
+    ax1.plot(merged["Time"], merged["predicted_glucose_mgdl"], color="tab:orange", linestyle="--", label="Predicted glucose (DE)")
+    ax1.set_ylabel("Glucose (mg/dL)", color="tab:orange")
+    ax1.tick_params(axis="y", labelcolor="tab:orange")
+
+    ax2 = ax1.twinx()
+    ax2.plot(merged["Time"], merged["heart_rate"], color="tab:green", alpha=0.5, label="Heart rate")
+    ax2.set_ylabel("Heart rate (bpm)", color="tab:green")
+
+    ax3 = ax1.twinx()
+    ax3.spines["right"].set_position(("outward", 60))
+    nz = merged["bolus_dose"] > 0
+    if nz.any():  # only plot if there is at least one nonzero bolus
+        ax3.stem(merged["Time"].values[nz], merged["bolus_dose"].values[nz],
+                 linefmt="C3-", markerfmt="C3o", basefmt=" ", label="Bolus (U)")
+    ax3.plot(merged["Time"], merged["adjusted_basal_per_min_U"]*60.0, color="tab:blue", linestyle="-", label="Adjusted basal (U/hour)")
+    ax3.set_ylabel("Insulin (U)", color="tab:blue")
+
+    ticks = pick_xticks(merged["Time"].values, max_ticks=12)
+    ax1.set_xticks(ticks)
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+    plt.setp(ax1.get_xticklabels(), rotation=45, ha="right")
+
+    lines, labels = [], []
+    for ax in (ax1, ax2, ax3):
+        lns, lbs = ax.get_legend_handles_labels()
+        lines += lns; labels += lbs
+    ax1.legend(lines, labels, loc="upper right")
+    p2 = os.path.join(out_folder, f"Patient_{pid_str}_DE.png")
+    fig.tight_layout()
+    fig.savefig(p2)
+    plt.close(fig)
+
+    print(f"Saved plots: {p1} , {p2}")
+
+# -------------------- Runner --------------------
+if __name__ == "__main__":
+    DATA_FOLDER = "/blue/bme4409/ndadisman"
+    os.makedirs(OUT_FOLDER, exist_ok=True)
+
+    patient_ids = [2301,2302,2303,2304,2305,2306,2307,2308,2309,2310,2313,2314,2320,2401,2403,2404,2405]
+    for pid in patient_ids:
+        process_patient(DATA_FOLDER, pid, OUT_FOLDER)
